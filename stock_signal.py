@@ -43,8 +43,8 @@ st.success(f"✅ Analyzing {len(tickers)} stock(s): {', '.join(tickers)}")
 # ------------------------------
 period = "1y"
 rsi_period = 9
-buy_threshold = 40
-sell_threshold = 65
+buy_threshold = 33
+sell_threshold = 67
 tcost = 0.002
 
 # Display parameters
@@ -263,11 +263,11 @@ fundamental_df = fundamental_df.sort_values(by='Fundamental Score', ascending=Fa
 # ------------------------------
 # Calculate Position Sizing
 # ------------------------------
-TOTAL_CAPITAL = 1000000  # Total capital in Liras
+TOTAL_CAPITAL = 10000  # Total capital in Liras
 total_trades = results_df["Number of Trades"].sum()
 
 if total_trades > 0:
-    capital_per_trade = 5000 # TOTAL_CAPITAL / (total_trades/2)
+    capital_per_trade = 1000 # TOTAL_CAPITAL / (total_trades/2)
 else:
     capital_per_trade = 0
 
@@ -303,7 +303,9 @@ st.subheader("📈 Technical Strategy Results")
 st.dataframe(results_df, use_container_width=True)
 
 # Display capital allocation info
-st.info(f"💰 **Capital Allocation:** Total Capital = ₺{TOTAL_CAPITAL:,.0f} | Total Trades = {total_trades} | Capital per Trade = ₺{capital_per_trade:,.2f}")
+# st.info(f"💰 **Capital Allocation:** Total Capital = ₺{TOTAL_CAPITAL:,.0f} | Total Trades = {total_trades} | Capital per Trade = ₺{capital_per_trade:,.2f}")
+st.info(f"💰 Capital per Trade = ₺{capital_per_trade:,.2f}")
+
 
 col1, col2 = st.columns(2)
 with col1:
