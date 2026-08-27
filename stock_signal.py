@@ -1,802 +1,447 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
-from sklearn.preprocessing import MinMaxScaler
+import yfinance as yf
 import matplotlib.pyplot as plt
+import datetime
+import warnings
 
-st.set_page_config(page_title="Custom Stock Technical & Fundamental Strategy with Machine Forecast", layout="wide")
+warnings.filterwarnings("ignore")
 
-# ------------------------------
-# Title
-# ------------------------------
-st.title("📊 Custom Stock Technical & Fundamental Strategy — Backtest & LSTM Forecast")
+st.set_page_config(page_title="Trend Strategy Backtester", layout="wide")
 
-# ------------------------------
-# User Input for Tickers
-# ------------------------------
-st.subheader("📝 Enter Stock Tickers")
-ticker_input = st.text_area(
-    "Enter stock tickers (one per line or comma-separated):",
-    value="AAPL, MSFT, GOOGL, AMZN, NVDA, TSLA, META, JNJ, V, GLD, SLV",
-    height=100
-)
+DEFAULT_TICKERS = "SI=F, EREGL.IS, AYEN.IS, XU030.IS, ISCTR.IS"
 
 
-# Parse ticker input
-if ticker_input:
-    # Split by commas or newlines and clean up
-    tickers = [t.strip().upper() for t in ticker_input.replace('\n', ',').split(',') if t.strip()]
-else:
-    tickers = []
+# ============================================================
+#  CORE STRATEGY LOGIC (same as the original script, just
+#  parametrized so fee / tp-range / ema-length are configurable)
+# ============================================================
 
-if not tickers:
-    st.warning("⚠️ Please enter at least one ticker symbol.")
-    st.stop()
+def backtest_long_only(df, signal_col, long_tp, fee):
+    """
+    Long-only strategy driven by a generic +1/-1 trend/signal column.
+    Enter long when signal flips to +1 at that bar's close; exit either
+    when the signal flips to -1, or when the running total P&L on the
+    open position reaches long_tp — whichever comes first.
+    """
+    prices = df["Close"].values
+    signal = df[signal_col].values
+    n = len(prices)
+    strat_rets = np.zeros(n)
+    in_position = 0
+    entry_price = 0.0
+    current_signal = 0
 
-st.success(f"✅ Analyzing {len(tickers)} stock(s): {', '.join(tickers)}")
+    for i in range(1, n):
+        if signal[i] != current_signal:
+            current_signal = signal[i]
+            if current_signal == 1:
+                in_position = 1
+                entry_price = prices[i]
+                strat_rets[i] -= fee
+            else:
+                in_position = 0
+                strat_rets[i] -= fee
+            continue
 
-# ------------------------------
-# Fixed Parameters (Default Values)
-# ------------------------------
-period = "1y"
-rsi_period = 9
-buy_threshold = 33
-sell_threshold = 67
-tcost = 0.002
+        if in_position == 1:
+            daily_pct = (prices[i] - prices[i - 1]) / prices[i - 1]
+            strat_rets[i] += daily_pct
+            total_pnl = (prices[i] - entry_price) / entry_price
+            if total_pnl >= long_tp:
+                strat_rets[i] -= fee
+                in_position = 0
 
-# Display parameters
-st.info(f"**Strategy Parameters:** Period = {period} | RSI Period = {rsi_period} | Buy Threshold (RSI < {buy_threshold}) | Sell Threshold (RSI > {sell_threshold}) | Transaction Cost = {tcost*100}%")
+    return strat_rets
 
-# ------------------------------
-# Fetch Fundamental Ratios
-# ------------------------------
-def get_fundamental_ratios(ticker):
-    """Fetch key fundamental ratios from Yahoo Finance"""
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
 
-        ratios = {
-            'pb': info.get('priceToBook', None),
-            'roe': info.get('returnOnEquity', None),
-            'profit_margin': info.get('profitMargins', None)
-        }
-        return ratios
-    except:
-        return {'pb': None, 'roe': None, 'profit_margin': None}
+def backtest_short_only(df, signal_col, short_tp, fee):
+    """
+    Informational-only short-side backtest, used solely to find an
+    "optimal" short take-profit level so the status section can quote a
+    sensible target when the trend is DOWN. Not part of the traded
+    strategy (which stays long-only / flat).
+    """
+    prices = df["Close"].values
+    signal = df[signal_col].values
+    n = len(prices)
+    strat_rets = np.zeros(n)
+    in_position = 0
+    entry_price = 0.0
+    current_signal = 0
 
-# ------------------------------
-# EPS Function
-# ------------------------------
-def get_eps(ticker):
-    """Fetch EPS (Earnings Per Share) for a given ticker"""
-    try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        eps = info.get('trailingEps', None)
-        return eps if eps is not None else np.nan
-    except:
-        return np.nan
+    for i in range(1, n):
+        if signal[i] != current_signal:
+            current_signal = signal[i]
+            if current_signal == -1:
+                in_position = 1
+                entry_price = prices[i]
+                strat_rets[i] -= fee
+            else:
+                in_position = 0
+                strat_rets[i] -= fee
+            continue
 
-# ------------------------------
-# RSI Function
-# ------------------------------
-def compute_rsi(series, period=14):
+        if in_position == 1:
+            daily_pct = (prices[i] - prices[i - 1]) / prices[i - 1]
+            strat_rets[i] += -daily_pct
+            total_pnl = (entry_price - prices[i]) / entry_price
+            if total_pnl >= short_tp:
+                strat_rets[i] -= fee
+                in_position = 0
+
+    return strat_rets
+
+
+def get_trade_entry_and_tp_long_only(df, signal_col, long_tp):
+    """Most recent live long entry price and its take-profit target."""
+    prices = df["Close"].values
+    signal = df[signal_col].values
+    n = len(prices)
+    in_position = 0
+    entry_price = 0.0
+    current_signal = 0
+    last_entry_price = None
+    last_was_long = False
+
+    for i in range(1, n):
+        if signal[i] != current_signal:
+            current_signal = signal[i]
+            if current_signal == 1:
+                in_position = 1
+                entry_price = prices[i]
+                last_entry_price = entry_price
+                last_was_long = True
+            else:
+                in_position = 0
+                last_was_long = False
+            continue
+
+        if in_position == 1:
+            total_pnl = (prices[i] - entry_price) / entry_price
+            if total_pnl >= long_tp:
+                in_position = 0
+                last_was_long = False
+
+    if last_entry_price is not None and last_was_long:
+        tp_price = last_entry_price * (1 + long_tp)
+        return round(last_entry_price, 2), round(tp_price, 2)
+    return None, None
+
+
+def calculate_metrics(returns):
+    if len(returns) == 0 or np.std(returns) == 0:
+        return 0, 0, 0, 0
+    ann_ret = np.mean(returns) * 252
+    ann_vol = np.std(returns) * np.sqrt(252)
+    sharpe = ann_ret / ann_vol if ann_vol != 0 else 0
+
+    cum_ret = np.cumprod(1 + returns)
+    peak = np.maximum.accumulate(cum_ret)
+    mdd = np.max((peak - cum_ret) / peak) if len(cum_ret) else 0
+    calmar = ann_ret / mdd if mdd != 0 else 0
+    return ann_ret, ann_vol, sharpe, calmar
+
+
+def get_rsi(series, period=14):
     delta = series.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/period, min_periods=period).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, min_periods=period).mean()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
 
-# ------------------------------
-# Backtest Function
-# ------------------------------
-def backtest_strategy(df, x1, x2, tcost):
-    open_positions = []
-    closed_trades = []
-    buy_signals_idx = []
-    sell_signals_idx = []
 
+def optimize_long_tp(df, signal_col, tp_ranges, fee):
+    best_sharpe = -np.inf
+    best_tp = tp_ranges[0]
+    for l_tp in tp_ranges:
+        rets = backtest_long_only(df, signal_col, l_tp, fee)
+        _, _, sharpe, _ = calculate_metrics(rets)
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_tp = l_tp
+    return best_tp
+
+
+def optimize_short_tp(df, signal_col, tp_ranges, fee):
+    best_sharpe = -np.inf
+    best_tp = tp_ranges[0]
+    for s_tp in tp_ranges:
+        rets = backtest_short_only(df, signal_col, s_tp, fee)
+        _, _, sharpe, _ = calculate_metrics(rets)
+        if sharpe > best_sharpe:
+            best_sharpe = sharpe
+            best_tp = s_tp
+    return best_tp
+
+
+def trend_status(df, signal_col, long_tp, short_tp):
+    """
+    Live status for a given signal column: current side, how many days
+    the current streak has run, the entry level, unrealized P&L, and
+    the take-profit / limit-order target for closing the position.
+    """
+    signal = df[signal_col].values
+    prices = df["Close"].values
+    dates = df.index
+    n = len(prices)
+
+    current_sig = signal[-1]
+
+    entry_idx = n - 1
+    for i in range(n - 2, -1, -1):
+        if signal[i] != current_sig:
+            break
+        entry_idx = i
+
+    days_in_trend = n - entry_idx
+    entry_price = float(prices[entry_idx])
+    entry_date = dates[entry_idx].strftime("%Y-%m-%d")
+    current_price = float(prices[-1])
+
+    if current_sig == 1:
+        side = "LONG"
+        pnl_pct = (current_price - entry_price) / entry_price * 100
+        target_price = entry_price * (1 + long_tp)
+        target_label = "Limit order (take-profit) to CLOSE the long"
+    else:
+        side = "DOWN / FLAT (long-only strategy takes no position)"
+        pnl_pct = (entry_price - current_price) / entry_price * 100
+        target_price = entry_price * (1 - short_tp)
+        target_label = "Informational SHORT target (not traded)"
+
+    return {
+        "side": side,
+        "days_in_trend": days_in_trend,
+        "entry_price": round(entry_price, 2),
+        "entry_date": entry_date,
+        "current_price": round(current_price, 2),
+        "pnl_pct": round(pnl_pct, 2),
+        "target_price": round(target_price, 2),
+        "target_label": target_label,
+    }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_data(ticker, start, end):
+    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
+    if df is None or df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df
+
+
+def build_signals(df, ema_length):
+    df = df.copy()
+    df["HA_Close"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
+    ha_open = np.zeros(len(df))
+    ha_open[0] = (df["Open"].iloc[0] + df["Close"].iloc[0]) / 2
     for i in range(1, len(df)):
-        rsi = df["RSI"].iloc[i]
-        price = df["Close"].iloc[i]
-        date = df.index[i]
+        ha_open[i] = (ha_open[i - 1] + df["HA_Close"].iloc[i - 1]) / 2
+    df["HA_Open"] = ha_open
+    df["HA_Trend"] = np.where(df["HA_Close"] >= df["HA_Open"], 1, -1)
 
-        if rsi < x1:
-            open_positions.append({"entry_price": price, "entry_date": date, "entry_idx": i})
-            buy_signals_idx.append(i)
-        elif rsi > x2 and open_positions:
-            entry = open_positions.pop(0)
-            sell_signals_idx.append(i)
-            closed_trades.append({
-                "buy_date": entry["entry_date"],
-                "buy_price": entry["entry_price"],
-                "sell_date": date,
-                "sell_price": price,
-                "return": (price - entry["entry_price"]) / entry["entry_price"] - tcost
-            })
+    df["EMA_Val"] = df["Close"].ewm(span=ema_length, adjust=False).mean()
+    df["EMA_Trend"] = np.where(df["Close"] >= df["EMA_Val"], 1, -1)
 
-    total_return = np.sum([t["return"] for t in closed_trades])
-    avg_return = np.mean([t["return"] for t in closed_trades]) if closed_trades else 0
-    return total_return, avg_return, closed_trades, buy_signals_idx, sell_signals_idx
+    df["RSI"] = get_rsi(df["Close"])
+    return df
 
-# ------------------------------
-# Analysis Loop
-# ------------------------------
-st.subheader("🔍 Scanning Stocks...")
 
-results = []
-buy_signals = []
-sell_signals = []
-first_stock_data = None
-fundamental_results = []
-all_ratios = []
+# ============================================================
+#  UI
+# ============================================================
 
-for idx, ticker in enumerate(tickers):
-    try:
-        data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-        if data.empty:
-            st.warning(f"No data found for {ticker}")
+st.title("📈 Trend-Following Strategy Backtester")
+st.caption(
+    "Heikin-Ashi vs EMA trend, long-only, optimal take-profit search vs Buy & Hold "
+    "— same logic as the original script, run across as many tickers as you like."
+)
+
+START_DATE = datetime.date(2026, 1, 1)
+END_DATE = datetime.date.today() + datetime.timedelta(days=1)
+
+with st.sidebar:
+    st.header("Settings")
+    tickers_input = st.text_input("Tickers (comma-separated)", value=DEFAULT_TICKERS)
+    st.caption(f"Backtest window: **{START_DATE}** → **{END_DATE}** (fixed, start of 2026 to latest close)")
+    fee = st.number_input(
+        "Fee per trade (fraction)", value=0.0020, step=0.0005, format="%.4f"
+    )
+    ema_length = st.number_input("EMA length", value=9, min_value=2, max_value=200, step=1)
+
+    st.subheader("Take-profit grid search")
+    tp_min = st.number_input("Min TP", value=0.01, step=0.005, format="%.3f")
+    tp_max = st.number_input("Max TP", value=0.15, step=0.005, format="%.3f")
+    tp_step = st.number_input("Step", value=0.005, step=0.001, format="%.3f")
+
+    run_button = st.button("Run Backtest", type="primary", use_container_width=True)
+
+if not run_button:
+    st.info("Enter one or more tickers in the sidebar (comma-separated) and click **Run Backtest**.")
+    st.stop()
+
+tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+if not tickers:
+    st.warning("Please enter at least one ticker.")
+    st.stop()
+
+tp_ranges = np.arange(tp_min, tp_max + tp_step / 2, tp_step)
+tp_ranges = tp_ranges[tp_ranges > 0]
+
+for ticker in tickers:
+    st.divider()
+    st.subheader(f"📊 {ticker}")
+
+    with st.spinner(f"Downloading & backtesting {ticker}..."):
+        try:
+            df = load_data(ticker, START_DATE.strftime("%Y-%m-%d"), END_DATE.strftime("%Y-%m-%d"))
+        except Exception as e:
+            st.error(f"Failed to download {ticker}: {e}")
             continue
-        data["RSI"] = compute_rsi(data["Close"], rsi_period)
-        data = data.dropna()
 
-        total_return, avg_return, trades, buy_idx, sell_idx = backtest_strategy(data, buy_threshold, sell_threshold, tcost)
-        latest_rsi = float(data["RSI"].iloc[-1])
-        latest_close = float(data["Close"].iloc[-1])
+        if df is None or df.empty or len(df) < 30:
+            st.warning(f"No / insufficient price history for **{ticker}** in this date range.")
+            continue
 
-        # Fetch EPS
-        eps = get_eps(ticker)
+        try:
+            df = build_signals(df, ema_length)
 
-        # Calculate P/E ratio manually from price and EPS
-        if not np.isnan(eps) and eps > 0:
-            calculated_pe = latest_close / eps
-        else:
-            calculated_pe = None
+            best_tp_ha = optimize_long_tp(df, "HA_Trend", tp_ranges, fee)
+            best_tp_ema = optimize_long_tp(df, "EMA_Trend", tp_ranges, fee)
+            best_short_tp_ha = optimize_short_tp(df, "HA_Trend", tp_ranges, fee)
+            best_short_tp_ema = optimize_short_tp(df, "EMA_Trend", tp_ranges, fee)
 
-        # Fetch fundamental ratios
-        ratios = get_fundamental_ratios(ticker)
-        # Add calculated P/E to ratios
-        ratios['pe'] = calculated_pe
-        all_ratios.append(ratios)
+            ha_rets = backtest_long_only(df, "HA_Trend", best_tp_ha, fee)
+            ema_rets = backtest_long_only(df, "EMA_Trend", best_tp_ema, fee)
 
-        if latest_rsi < buy_threshold:
-            # Only add to buy signals if EPS is positive
-            if not np.isnan(eps) and eps > 0:
-                signal = "BUY"
-                buy_signals.append((ticker, latest_close, latest_rsi, eps))
+            ha_ann_r, ha_ann_v, ha_sha, ha_cal = calculate_metrics(ha_rets)
+            ema_ann_r, ema_ann_v, ema_sha, ema_cal = calculate_metrics(ema_rets)
+
+            bh_rets = df["Close"].pct_change().fillna(0).values
+            bh_ann_r, bh_ann_v, bh_sha, bh_cal = calculate_metrics(bh_rets)
+
+            ha_trade_price, ha_tp_price = get_trade_entry_and_tp_long_only(df, "HA_Trend", best_tp_ha)
+            ema_trade_price, ema_tp_price = get_trade_entry_and_tp_long_only(df, "EMA_Trend", best_tp_ema)
+
+            cum_ha = np.cumprod(1 + ha_rets)
+            cum_ema = np.cumprod(1 + ema_rets)
+            cum_bh = np.cumprod(1 + bh_rets)
+
+            last = df.iloc[-1]
+        except Exception as e:
+            st.error(f"Error while analyzing {ticker}: {e}")
+            continue
+
+    ha_status = trend_status(df, "HA_Trend", best_tp_ha, best_short_tp_ha)
+    ema_status = trend_status(df, "EMA_Trend", best_tp_ema, best_short_tp_ema)
+
+    current_price = float(last["Close"])
+
+    top1, top2 = st.columns(2)
+    top1.metric("Current Price", f"{current_price:.2f}")
+    top2.metric("RSI(14)", f"{float(last['RSI']):.1f}" if not np.isnan(last["RSI"]) else "n/a")
+
+    st.markdown("#### 🎯 Current Action & Target Levels (based on optimal TP thresholds)")
+    a1, a2 = st.columns(2)
+    for col, name, status, l_tp, s_tp in [
+        (a1, "Heikin-Ashi", ha_status, best_tp_ha, best_short_tp_ha),
+        (a2, f"EMA({ema_length})", ema_status, best_tp_ema, best_short_tp_ema),
+    ]:
+        with col:
+            is_long = status["side"] == "LONG"
+            action_label = "🟢 LONG — holding" if is_long else "⚪ FLAT — no position (long-only strategy)"
+            st.markdown(f"**{name}**")
+            st.write(f"Action: **{action_label}**")
+            gap_pct = (status["target_price"] - current_price) / current_price * 100
+            g1, g2 = st.columns(2)
+            g1.metric("Current Price", f"{current_price:.2f}")
+            g2.metric(
+                "Target Price" if is_long else "Informational Target",
+                f"{status['target_price']:.2f}",
+                delta=f"{gap_pct:+.2f}% away",
+            )
+            st.caption(
+                f"Entry {status['entry_date']} @ {status['entry_price']} · "
+                f"day {status['days_in_trend']} of trend · "
+                f"unrealized P&L {status['pnl_pct']:+.2f}% · "
+                f"optimal {'long' if is_long else 'short'} TP = "
+                f"{(l_tp if is_long else s_tp)*100:.1f}%"
+            )
+
+    with st.expander("Full performance summary (vs Buy & Hold)"):
+        summary_data = [
+        {
+            "Strategy": "Heikin-Ashi (long-only)",
+            "Opt Long TP": f"{best_tp_ha*100:.1f}%",
+            "Ann Ret": f"{ha_ann_r*100:.1f}%",
+            "Ann Vol": f"{ha_ann_v*100:.1f}%",
+            "Sharpe": round(ha_sha, 2),
+            "Calmar": round(ha_cal, 2),
+            "Trade Price": ha_trade_price,
+            "TP Price": ha_tp_price,
+            "TP Diff": None if ha_trade_price is None else round(ha_tp_price - ha_trade_price, 2),
+        },
+        {
+            "Strategy": f"EMA({ema_length}) (long-only)",
+            "Opt Long TP": f"{best_tp_ema*100:.1f}%",
+            "Ann Ret": f"{ema_ann_r*100:.1f}%",
+            "Ann Vol": f"{ema_ann_v*100:.1f}%",
+            "Sharpe": round(ema_sha, 2),
+            "Calmar": round(ema_cal, 2),
+            "Trade Price": ema_trade_price,
+            "TP Price": ema_tp_price,
+            "TP Diff": None if ema_trade_price is None else round(ema_tp_price - ema_trade_price, 2),
+        },
+        {
+            "Strategy": "Buy & Hold",
+            "Opt Long TP": "—",
+            "Ann Ret": f"{bh_ann_r*100:.1f}%",
+            "Ann Vol": f"{bh_ann_v*100:.1f}%",
+            "Sharpe": round(bh_sha, 2),
+            "Calmar": round(bh_cal, 2),
+            "Trade Price": round(float(df["Close"].iloc[0]), 2),
+            "TP Price": "—",
+            "TP Diff": "—",
+        },
+    ]
+    results_df = pd.DataFrame(summary_data)
+    st.dataframe(results_df, use_container_width=True, hide_index=True)
+
+    ha_status = trend_status(df, "HA_Trend", best_tp_ha, best_short_tp_ha)
+    ema_status = trend_status(df, "EMA_Trend", best_tp_ema, best_short_tp_ema)
+
+    st.markdown("**Today's Action — Live Position Status**")
+    s1, s2 = st.columns(2)
+    for col, name, status, l_tp, s_tp in [
+        (s1, "Heikin-Ashi", ha_status, best_tp_ha, best_short_tp_ha),
+        (s2, f"EMA({ema_length})", ema_status, best_tp_ema, best_short_tp_ema),
+    ]:
+        with col:
+            st.markdown(f"**{name}**")
+            st.write(f"Side: {status['side']}")
+            st.write(f"Day in current trend: {status['days_in_trend']}")
+            st.write(f"Entry: {status['entry_date']} @ {status['entry_price']}")
+            st.write(f"Current price: {status['current_price']}")
+            st.write(f"Unrealized P&L: {status['pnl_pct']:+.2f}%")
+            st.write(f"{status['target_label']}: **{status['target_price']}**")
+            if status["side"] == "LONG":
+                st.caption(f"Optimal long TP used: {l_tp*100:.1f}%")
             else:
-                signal = "HOLD"
-        elif latest_rsi > sell_threshold:
-            signal = "SELL"
-            sell_signals.append((ticker, latest_close, latest_rsi, eps))
-        else:
-            signal = "HOLD"
-
-        results.append({
-            "Ticker": ticker,
-            "Signal": signal,
-            "Latest RSI": round(latest_rsi, 2),
-            "Latest Close": round(latest_close, 2),
-            "EPS": round(eps, 4) if not np.isnan(eps) else "N/A",
-            "Cumulative Return (%)": round(total_return * 100, 2),
-            "Return per Trade (%)": round(avg_return * 100, 2),
-            "Number of Trades": len(trades)
-        })
-
-        # Store fundamental data
-        fundamental_results.append({
-            "Ticker": ticker,
-            "P/E": round(calculated_pe, 2) if calculated_pe is not None else "N/A",
-            "P/B": round(ratios['pb'], 2) if ratios['pb'] is not None else "N/A",
-            "ROE": round(ratios['roe'] * 100, 2) if ratios['roe'] is not None else "N/A",
-            "Profit Margin": round(ratios['profit_margin'] * 100, 2) if ratios['profit_margin'] is not None else "N/A",
-        })
-
-        # Store first stock data for plotting
-        if idx == 0:
-            first_stock_data = {
-                "data": data,
-                "ticker": ticker,
-                "buy_idx": buy_idx,
-                "sell_idx": sell_idx
-            }
-
-    except Exception as e:
-        st.error(f"Error with {ticker}: {e}")
-
-# ------------------------------
-# Convert to DataFrame
-# ------------------------------
-results_df = pd.DataFrame(results).sort_values(by="Return per Trade (%)", ascending=False)
-fundamental_df = pd.DataFrame(fundamental_results)
-
-# ------------------------------
-# Calculate Fundamental Scores
-# ------------------------------
-# Extract valid ratios for normalization
-valid_pe = [r['pe'] for r in all_ratios if r['pe'] is not None and r['pe'] > 0]
-valid_pb = [r['pb'] for r in all_ratios if r['pb'] is not None and r['pb'] > 0]
-valid_roe = [r['roe'] for r in all_ratios if r['roe'] is not None]
-valid_margin = [r['profit_margin'] for r in all_ratios if r['profit_margin'] is not None]
-
-# Calculate fundamental scores
-def calculate_fundamental_score(idx):
-    ratios = all_ratios[idx]
-    score_components = []
-
-    # P/E Score (lower is better) - Weight: 30%
-    if ratios['pe'] is not None and ratios['pe'] > 0 and len(valid_pe) > 1:
-        pe_score = 100 * (max(valid_pe) - ratios['pe']) / (max(valid_pe) - min(valid_pe))
-        score_components.append((pe_score, 0.30))
-
-    # P/B Score (lower is better) - Weight: 25%
-    if ratios['pb'] is not None and ratios['pb'] > 0 and len(valid_pb) > 1:
-        pb_score = 100 * (max(valid_pb) - ratios['pb']) / (max(valid_pb) - min(valid_pb))
-        score_components.append((pb_score, 0.25))
-
-    # ROE Score (higher is better) - Weight: 25%
-    if ratios['roe'] is not None and len(valid_roe) > 1:
-        roe_score = 100 * (ratios['roe'] - min(valid_roe)) / (max(valid_roe) - min(valid_roe))
-        score_components.append((roe_score, 0.25))
-
-    # Profit Margin Score (higher is better) - Weight: 20%
-    if ratios['profit_margin'] is not None and len(valid_margin) > 1:
-        margin_score = 100 * (ratios['profit_margin'] - min(valid_margin)) / (max(valid_margin) - min(valid_margin))
-        score_components.append((margin_score, 0.20))
-
-    if not score_components:
-        return None
-
-    # Normalize weights
-    total_weight = sum([w for _, w in score_components])
-    final_score = sum([s * w for s, w in score_components]) / total_weight
-
-    return round(final_score, 2)
-
-fundamental_df['Fundamental Score'] = [calculate_fundamental_score(i) for i in range(len(all_ratios))]
-fundamental_df = fundamental_df.sort_values(by='Fundamental Score', ascending=False, na_position='last')
-
-# ------------------------------
-# Calculate Position Sizing
-# ------------------------------
-TOTAL_CAPITAL = 10000  # Total capital in Liras
-total_trades = results_df["Number of Trades"].sum()
-
-if total_trades > 0:
-    capital_per_trade = 1000 # TOTAL_CAPITAL / (total_trades/2)
-else:
-    capital_per_trade = 0
-
-# Format buy and sell DataFrames with proper rounding and order size
-if buy_signals:
-    buy_df = pd.DataFrame(buy_signals, columns=["Ticker", "Close Price", "RSI", "EPS"])
-    buy_df["Close Price"] = buy_df["Close Price"].round(2)
-    buy_df["RSI"] = buy_df["RSI"].round(2)
-    buy_df["EPS"] = buy_df["EPS"].round(4)
-    # Calculate order size (number of shares)
-    buy_df["Order Size"] = (capital_per_trade / buy_df["Close Price"]).apply(lambda x: int(round(x)))
-else:
-    buy_df = pd.DataFrame()
-
-if sell_signals:
-    sell_df = pd.DataFrame(sell_signals, columns=["Ticker", "Close Price", "RSI", "EPS"])
-    sell_df["Close Price"] = sell_df["Close Price"].round(2)
-    sell_df["RSI"] = sell_df["RSI"].round(2)
-    sell_df["EPS"] = sell_df["EPS"].apply(lambda x: round(x, 4) if not np.isnan(x) else "N/A")
-    # Calculate order size (number of shares)
-    sell_df["Order Size"] = (capital_per_trade / sell_df["Close Price"]).apply(lambda x: int(round(x)))
-else:
-    sell_df = pd.DataFrame()
-
-# ------------------------------
-# Display Results
-# ------------------------------
-st.subheader("📊 Fundamental Analysis Results")
-st.info("💡 **Fundamental Score**: Higher score (closer to 100) = More Undervalued | Lower score (closer to 0) = More Overvalued")
-st.dataframe(fundamental_df, use_container_width=True)
-
-st.subheader("📈 Technical Strategy Results")
-st.dataframe(results_df, use_container_width=True)
-
-# Display capital allocation info
-# st.info(f"💰 **Capital Allocation:** Total Capital = ₺{TOTAL_CAPITAL:,.0f} | Total Trades = {total_trades} | Capital per Trade = ₺{capital_per_trade:,.2f}")
-st.info(f"💰 Capital per Trade = ₺{capital_per_trade:,.2f}")
-
-
-col1, col2 = st.columns(2)
-with col1:
-    st.subheader("🟢 Current BUY Signals (EPS > 0)")
-    if not buy_df.empty:
-        st.dataframe(buy_df, use_container_width=True)
-    else:
-        st.info("No buy signals with positive EPS found.")
-
-with col2:
-    st.subheader("🔴 Current SELL Signals")
-    if not sell_df.empty:
-        st.dataframe(sell_df, use_container_width=True)
-    else:
-        st.info("No sell signals found.")
-
-# ================================================================
-# PART 1.5: Plot Close Price with Buy/Sell Signals for First Stock
-# ================================================================
-if first_stock_data:
-    st.subheader(f"📉 Close Price with Buy/Sell Signals — {first_stock_data['ticker']}")
+                st.caption(f"Optimal short TP used (informational): {s_tp*100:.1f}%")
 
     fig, ax = plt.subplots(figsize=(12, 5))
-    data = first_stock_data["data"]
-
-    # Plot close price
-    ax.plot(data.index, data["Close"], label="Close Price", color="steelblue", linewidth=1.5)
-
-    # Mark buy signals (green)
-    if first_stock_data["buy_idx"]:
-        buy_dates = data.index[first_stock_data["buy_idx"]]
-        buy_prices = data["Close"].iloc[first_stock_data["buy_idx"]]
-        ax.scatter(buy_dates, buy_prices, color="green", marker="^", s=100, label="Buy Signal", zorder=5)
-
-    # Mark sell signals (red)
-    if first_stock_data["sell_idx"]:
-        sell_dates = data.index[first_stock_data["sell_idx"]]
-        sell_prices = data["Close"].iloc[first_stock_data["sell_idx"]]
-        ax.scatter(sell_dates, sell_prices, color="red", marker="v", s=100, label="Sell Signal", zorder=5)
-
-    ax.set_title(f"{first_stock_data['ticker']} — Close Price with RSI-Based Signals")
+    ax.plot(df.index, cum_ha, label=f"Heikin-Ashi (TP={best_tp_ha*100:.1f}%)", linewidth=1.8)
+    ax.plot(df.index, cum_ema, label=f"EMA({ema_length}) (TP={best_tp_ema*100:.1f}%)", linewidth=1.8)
+    ax.plot(df.index, cum_bh, label="Buy & Hold", linewidth=1.8, linestyle="--", color="gray")
+    ax.set_title(f"{ticker} — Long-Only Strategy Comparison: Heikin-Ashi vs EMA vs Buy & Hold",
+                 fontsize=13, fontweight="bold")
     ax.set_xlabel("Date")
-    ax.set_ylabel("Close Price")
-    ax.legend()
+    ax.set_ylabel("Cumulative Return (Growth of $1)")
+    ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
+    fig.tight_layout()
     st.pyplot(fig)
-
-# ================================================================
-# PART 2: Select Stock for LSTM Forecast
-# ================================================================
-st.subheader("🤖 LSTM RSI Forecast (User-Selected Stock)")
-
-selected_ticker = st.selectbox("Select a stock for RSI forecast:", ["None"] + tickers)
-
-# ------------------------------
-# LSTM Function
-# ------------------------------
-def lstm_forecast_rsi(rsi_series, n_past=9, n_future=4):
-    if len(rsi_series) < n_past + 5:
-        return [np.nan] * n_future
-
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    rsi_scaled = scaler.fit_transform(rsi_series.values.reshape(-1, 1))
-
-    X, y = [], []
-    for i in range(n_past, len(rsi_scaled) - n_future):
-        X.append(rsi_scaled[i - n_past:i, 0])
-        y.append(rsi_scaled[i:i + n_future, 0])
-    X, y = np.array(X), np.array(y)
-    X = X.reshape((X.shape[0], X.shape[1], 1))
-
-    model = Sequential([
-        LSTM(50, activation='relu', input_shape=(n_past, 1)),
-        Dense(25, activation='relu'),
-        Dense(n_future)
-    ])
-    model.compile(optimizer='adam', loss='mse')
-    model.fit(X, y, epochs=30, batch_size=8, verbose=0)
-
-    last_window = rsi_scaled[-n_past:].reshape((1, n_past, 1))
-    forecast_scaled = model.predict(last_window, verbose=0)
-    forecast = scaler.inverse_transform(forecast_scaled.reshape(-1, 1)).flatten()
-    return forecast
-
-# ------------------------------
-# Run forecast only if user selected a stock
-# ------------------------------
-if selected_ticker != "None":
-    st.write(f"### 🔮 Forecasting RSI for: **{selected_ticker}**")
-    data = yf.download(selected_ticker, period=period, auto_adjust=True, progress=False)
-    data["RSI"] = compute_rsi(data["Close"], rsi_period)
-    data = data.dropna()
-
-    forecast = lstm_forecast_rsi(data["RSI"], n_past=9, n_future=4)
-
-    # Show forecast table
-    forecast_df = pd.DataFrame({
-        "Ticker": [selected_ticker],
-        "Day+1 RSI": [round(forecast[0], 2)],
-        "Day+2 RSI": [round(forecast[1], 2)],
-        "Day+3 RSI": [round(forecast[2], 2)],
-        "Day+4 RSI": [round(forecast[3], 2)],
-    })
-    st.dataframe(forecast_df, use_container_width=True)
-
-    # Plot RSI with forecast
-    st.write("📊 RSI Trend with Forecast")
-    fig, ax = plt.subplots(figsize=(10, 4))
-
-    # Plot historical RSI
-    ax.plot(data.index[-100:], data["RSI"].iloc[-100:], label="Historical RSI", color="steelblue", linewidth=2)
-
-    # Create future dates for forecast (assuming daily data)
-    last_date = data.index[-1]
-    forecast_dates = pd.date_range(start=last_date, periods=5, freq='D')[1:]  # Next 4 days
-
-    # Plot forecast RSI
-    ax.plot(forecast_dates, forecast, label="Forecasted RSI", color="orange", linewidth=2, linestyle='--', marker='o')
-
-    # Add horizontal lines for buy/sell thresholds
-    ax.axhline(y=buy_threshold, color='green', linestyle=':', alpha=0.7, label=f'Buy Threshold ({buy_threshold})')
-    ax.axhline(y=sell_threshold, color='red', linestyle=':', alpha=0.7, label=f'Sell Threshold ({sell_threshold})')
-
-    ax.set_title(f"{selected_ticker} — RSI with 4-Day Forecast")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("RSI")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    st.pyplot(fig)
-
-else:
-    st.info("Select a stock above to generate RSI LSTM forecast.")
-
-st.caption("Developed for educational and research purposes — RSI Strategy + LSTM Forecast on Custom Stocks.")
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import streamlit as st
-# import yfinance as yf
-# import pandas as pd
-# import numpy as np
-# from tensorflow.keras.models import Sequential
-# from tensorflow.keras.layers import LSTM, Dense
-# from sklearn.preprocessing import MinMaxScaler
-# import matplotlib.pyplot as plt
-
-# st.set_page_config(page_title="Custom Stock Technical & Fundamental Strategy with Machine Forecast", layout="wide")
-
-# # ------------------------------
-# # Title
-# # ------------------------------
-# st.title("📊 Custom Stock Technical Strategy — Backtest & LSTM Forecast")
-
-# # ------------------------------
-# # User Input for Tickers
-# # ------------------------------
-# st.subheader("📝 Enter Stock Tickers")
-# ticker_input = st.text_area(
-#     "Enter stock tickers (one per line or comma-separated):",
-#     value="BASGZ.IS, AFYON.IS, ENJSA.IS, EREGL.IS, AYEN.IS, PAGYO.IS, YGGYO.IS, TUPRS.IS, KRDMD.IS, SISE.IS",
-#     height=100
-# )
-
-# # Parse ticker input
-# if ticker_input:
-#     # Split by commas or newlines and clean up
-#     tickers = [t.strip().upper() for t in ticker_input.replace('\n', ',').split(',') if t.strip()]
-# else:
-#     tickers = []
-
-# if not tickers:
-#     st.warning("⚠️ Please enter at least one ticker symbol.")
-#     st.stop()
-
-# st.success(f"✅ Analyzing {len(tickers)} stock(s): {', '.join(tickers)}")
-
-# # ------------------------------
-# # Fixed Parameters (Default Values)
-# # ------------------------------
-# period = "1y"
-# rsi_period = 9
-# buy_threshold = 40
-# sell_threshold = 65
-# tcost = 0.002
-
-# # Display parameters
-# st.info(f"**Strategy Parameters:** Period = {period} | RSI Period = {rsi_period} | Buy Threshold (RSI < {buy_threshold}) | Sell Threshold (RSI > {sell_threshold}) | Transaction Cost = {tcost*100}%")
-
-# # ------------------------------
-# # EPS Function
-# # ------------------------------
-# def get_eps(ticker):
-#     """Fetch EPS (Earnings Per Share) for a given ticker"""
-#     try:
-#         stock = yf.Ticker(ticker)
-#         info = stock.info
-#         eps = info.get('trailingEps', None)
-#         return eps if eps is not None else np.nan
-#     except:
-#         return np.nan
-
-# # ------------------------------
-# # RSI Function
-# # ------------------------------
-# def compute_rsi(series, period=14):
-#     delta = series.diff()
-#     gain = delta.clip(lower=0).ewm(alpha=1/period, min_periods=period).mean()
-#     loss = (-delta.clip(upper=0)).ewm(alpha=1/period, min_periods=period).mean()
-#     rs = gain / loss
-#     return 100 - (100 / (1 + rs))
-
-# # ------------------------------
-# # Backtest Function
-# # ------------------------------
-# def backtest_strategy(df, x1, x2, tcost):
-#     open_positions = []
-#     closed_trades = []
-#     buy_signals_idx = []
-#     sell_signals_idx = []
-
-#     for i in range(1, len(df)):
-#         rsi = df["RSI"].iloc[i]
-#         price = df["Close"].iloc[i]
-#         date = df.index[i]
-
-#         if rsi < x1:
-#             open_positions.append({"entry_price": price, "entry_date": date, "entry_idx": i})
-#             buy_signals_idx.append(i)
-#         elif rsi > x2 and open_positions:
-#             entry = open_positions.pop(0)
-#             sell_signals_idx.append(i)
-#             closed_trades.append({
-#                 "buy_date": entry["entry_date"],
-#                 "buy_price": entry["entry_price"],
-#                 "sell_date": date,
-#                 "sell_price": price,
-#                 "return": (price - entry["entry_price"]) / entry["entry_price"] - tcost
-#             })
-
-#     total_return = np.sum([t["return"] for t in closed_trades])
-#     avg_return = np.mean([t["return"] for t in closed_trades]) if closed_trades else 0
-#     return total_return, avg_return, closed_trades, buy_signals_idx, sell_signals_idx
-
-# # ------------------------------
-# # Analysis Loop
-# # ------------------------------
-# st.subheader("🔍 Scanning Stocks...")
-
-# results = []
-# buy_signals = []
-# sell_signals = []
-# first_stock_data = None
-
-# for idx, ticker in enumerate(tickers):
-#     try:
-#         data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-#         if data.empty:
-#             st.warning(f"No data found for {ticker}")
-#             continue
-#         data["RSI"] = compute_rsi(data["Close"], rsi_period)
-#         data = data.dropna()
-
-#         total_return, avg_return, trades, buy_idx, sell_idx = backtest_strategy(data, buy_threshold, sell_threshold, tcost)
-#         latest_rsi = float(data["RSI"].iloc[-1])
-#         latest_close = float(data["Close"].iloc[-1])
-
-#         # Fetch EPS
-#         eps = get_eps(ticker)
-
-#         if latest_rsi < buy_threshold:
-#             # Only add to buy signals if EPS is positive
-#             if not np.isnan(eps) and eps > 0:
-#                 signal = "BUY"
-#                 buy_signals.append((ticker, latest_close, latest_rsi, eps))
-#             else:
-#                 signal = "HOLD"
-#         elif latest_rsi > sell_threshold:
-#             signal = "SELL"
-#             sell_signals.append((ticker, latest_close, latest_rsi, eps))
-#         else:
-#             signal = "HOLD"
-
-#         results.append({
-#             "Ticker": ticker,
-#             "Signal": signal,
-#             "Latest RSI": round(latest_rsi, 2),
-#             "Latest Close": round(latest_close, 2),
-#             "EPS": round(eps, 4) if not np.isnan(eps) else "N/A",
-#             "Cumulative Return (%)": round(total_return * 100, 2),
-#             "Return per Trade (%)": round(avg_return * 100, 2),
-#             "Number of Trades": len(trades)
-#         })
-
-#         # Store first stock data for plotting
-#         if idx == 0:
-#             first_stock_data = {
-#                 "data": data,
-#                 "ticker": ticker,
-#                 "buy_idx": buy_idx,
-#                 "sell_idx": sell_idx
-#             }
-
-#     except Exception as e:
-#         st.error(f"Error with {ticker}: {e}")
-
-# # ------------------------------
-# # Convert to DataFrame
-# # ------------------------------
-# results_df = pd.DataFrame(results).sort_values(by="Return per Trade (%)", ascending=False)
-
-# # ------------------------------
-# # Calculate Position Sizing
-# # ------------------------------
-# TOTAL_CAPITAL = 1000000  # Total capital in Liras
-# total_trades = results_df["Number of Trades"].sum()
-
-# if total_trades > 0:
-#     capital_per_trade = TOTAL_CAPITAL / (total_trades/2)
-# else:
-#     capital_per_trade = 0
-
-# # Format buy and sell DataFrames with proper rounding and order size
-# if buy_signals:
-#     buy_df = pd.DataFrame(buy_signals, columns=["Ticker", "Close Price", "RSI", "EPS"])
-#     buy_df["Close Price"] = buy_df["Close Price"].round(2)
-#     buy_df["RSI"] = buy_df["RSI"].round(2)
-#     buy_df["EPS"] = buy_df["EPS"].round(4)
-#     # Calculate order size (number of shares)
-#     buy_df["Order Size"] = (capital_per_trade / buy_df["Close Price"]).apply(lambda x: int(round(x)))
-# else:
-#     buy_df = pd.DataFrame()
-
-# if sell_signals:
-#     sell_df = pd.DataFrame(sell_signals, columns=["Ticker", "Close Price", "RSI", "EPS"])
-#     sell_df["Close Price"] = sell_df["Close Price"].round(2)
-#     sell_df["RSI"] = sell_df["RSI"].round(2)
-#     sell_df["EPS"] = sell_df["EPS"].apply(lambda x: round(x, 4) if not np.isnan(x) else "N/A")
-#     # Calculate order size (number of shares)
-#     sell_df["Order Size"] = (capital_per_trade / sell_df["Close Price"]).apply(lambda x: int(round(x)))
-# else:
-#     sell_df = pd.DataFrame()
-
-# # ------------------------------
-# # Display Results
-# # ------------------------------
-# st.subheader("📈 Technical Strategy Results")
-# st.dataframe(results_df, use_container_width=True)
-
-# # Display capital allocation info
-# st.info(f"💰 **Capital Allocation:** Total Capital = ₺{TOTAL_CAPITAL:,.0f} | Total Trades = {total_trades} | Capital per Trade = ₺{capital_per_trade:,.2f}")
-
-# col1, col2 = st.columns(2)
-# with col1:
-#     st.subheader("🟢 Current BUY Signals (EPS > 0)")
-#     if not buy_df.empty:
-#         st.dataframe(buy_df, use_container_width=True)
-#     else:
-#         st.info("No buy signals with positive EPS found.")
-
-# with col2:
-#     st.subheader("🔴 Current SELL Signals")
-#     if not sell_df.empty:
-#         st.dataframe(sell_df, use_container_width=True)
-#     else:
-#         st.info("No sell signals found.")
-
-# # ================================================================
-# # PART 1.5: Plot Close Price with Buy/Sell Signals for First Stock
-# # ================================================================
-# if first_stock_data:
-#     st.subheader(f"📉 Close Price with Buy/Sell Signals — {first_stock_data['ticker']}")
-
-#     fig, ax = plt.subplots(figsize=(12, 5))
-#     data = first_stock_data["data"]
-
-#     # Plot close price
-#     ax.plot(data.index, data["Close"], label="Close Price", color="steelblue", linewidth=1.5)
-
-#     # Mark buy signals (green)
-#     if first_stock_data["buy_idx"]:
-#         buy_dates = data.index[first_stock_data["buy_idx"]]
-#         buy_prices = data["Close"].iloc[first_stock_data["buy_idx"]]
-#         ax.scatter(buy_dates, buy_prices, color="green", marker="^", s=100, label="Buy Signal", zorder=5)
-
-#     # Mark sell signals (red)
-#     if first_stock_data["sell_idx"]:
-#         sell_dates = data.index[first_stock_data["sell_idx"]]
-#         sell_prices = data["Close"].iloc[first_stock_data["sell_idx"]]
-#         ax.scatter(sell_dates, sell_prices, color="red", marker="v", s=100, label="Sell Signal", zorder=5)
-
-#     ax.set_title(f"{first_stock_data['ticker']} — Close Price with RSI-Based Signals")
-#     ax.set_xlabel("Date")
-#     ax.set_ylabel("Close Price")
-#     ax.legend()
-#     ax.grid(True, alpha=0.3)
-#     st.pyplot(fig)
-
-# # ================================================================
-# # PART 2: Select Stock for LSTM Forecast
-# # ================================================================
-# st.subheader("🤖 LSTM RSI Forecast (User-Selected Stock)")
-
-# selected_ticker = st.selectbox("Select a stock for RSI forecast:", ["None"] + tickers)
-
-# # ------------------------------
-# # LSTM Function
-# # ------------------------------
-# def lstm_forecast_rsi(rsi_series, n_past=9, n_future=4):
-#     if len(rsi_series) < n_past + 5:
-#         return [np.nan] * n_future
-
-#     scaler = MinMaxScaler(feature_range=(0, 1))
-#     rsi_scaled = scaler.fit_transform(rsi_series.values.reshape(-1, 1))
-
-#     X, y = [], []
-#     for i in range(n_past, len(rsi_scaled) - n_future):
-#         X.append(rsi_scaled[i - n_past:i, 0])
-#         y.append(rsi_scaled[i:i + n_future, 0])
-#     X, y = np.array(X), np.array(y)
-#     X = X.reshape((X.shape[0], X.shape[1], 1))
-
-#     model = Sequential([
-#         LSTM(50, activation='relu', input_shape=(n_past, 1)),
-#         Dense(25, activation='relu'),
-#         Dense(n_future)
-#     ])
-#     model.compile(optimizer='adam', loss='mse')
-#     model.fit(X, y, epochs=30, batch_size=8, verbose=0)
-
-#     last_window = rsi_scaled[-n_past:].reshape((1, n_past, 1))
-#     forecast_scaled = model.predict(last_window)
-#     forecast = scaler.inverse_transform(forecast_scaled.reshape(-1, 1)).flatten()
-#     return forecast
-
-# # ------------------------------
-# # Run forecast only if user selected a stock
-# # ------------------------------
-# if selected_ticker != "None":
-#     st.write(f"### 🔮 Forecasting RSI for: **{selected_ticker}**")
-#     data = yf.download(selected_ticker, period=period, auto_adjust=True, progress=False)
-#     data["RSI"] = compute_rsi(data["Close"], rsi_period)
-#     data = data.dropna()
-
-#     forecast = lstm_forecast_rsi(data["RSI"], n_past=9, n_future=4)
-
-#     # Show forecast table
-#     forecast_df = pd.DataFrame({
-#         "Ticker": [selected_ticker],
-#         "Day+1 RSI": [round(forecast[0], 2)],
-#         "Day+2 RSI": [round(forecast[1], 2)],
-#         "Day+3 RSI": [round(forecast[2], 2)],
-#         "Day+4 RSI": [round(forecast[3], 2)],
-#     })
-#     st.dataframe(forecast_df, use_container_width=True)
-
-#     # Plot RSI with forecast
-#     st.write("📊 RSI Trend with Forecast")
-#     fig, ax = plt.subplots(figsize=(10, 4))
-
-#     # Plot historical RSI
-#     ax.plot(data.index[-100:], data["RSI"].iloc[-100:], label="Historical RSI", color="steelblue", linewidth=2)
-
-#     # Create future dates for forecast (assuming daily data)
-#     last_date = data.index[-1]
-#     forecast_dates = pd.date_range(start=last_date, periods=5, freq='D')[1:]  # Next 4 days
-
-#     # Plot forecast RSI
-#     ax.plot(forecast_dates, forecast, label="Forecasted RSI", color="orange", linewidth=2, linestyle='--', marker='o')
-
-#     # Add horizontal lines for buy/sell thresholds
-#     ax.axhline(y=buy_threshold, color='green', linestyle=':', alpha=0.7, label=f'Buy Threshold ({buy_threshold})')
-#     ax.axhline(y=sell_threshold, color='red', linestyle=':', alpha=0.7, label=f'Sell Threshold ({sell_threshold})')
-
-#     ax.set_title(f"{selected_ticker} — RSI with 4-Day Forecast")
-#     ax.set_xlabel("Date")
-#     ax.set_ylabel("RSI")
-#     ax.legend()
-#     ax.grid(True, alpha=0.3)
-#     st.pyplot(fig)
-
-# else:
-#     st.info("Select a stock above to generate RSI LSTM forecast.")
-
-# st.caption("Developed for educational and research purposes — RSI Strategy + LSTM Forecast on Custom Stocks.")
+    plt.close(fig)
