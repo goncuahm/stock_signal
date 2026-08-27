@@ -10,7 +10,7 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Trend Strategy Backtester", layout="wide")
 
-DEFAULT_TICKERS = "SI=F, EREGL.IS, AYEN.IS, XU030.IS, ISCTR.IS"
+DEFAULT_TICKERS = "SI=F, XU030.IS"
 
 
 # ============================================================
@@ -273,7 +273,7 @@ with st.sidebar:
     ema_length = st.number_input("EMA length", value=9, min_value=2, max_value=200, step=1)
 
     st.subheader("Take-profit grid search")
-    tp_min = st.number_input("Min TP", value=0.01, step=0.005, format="%.3f")
+    tp_min = st.number_input("Min TP", value=0.025, step=0.005, format="%.3f")
     tp_max = st.number_input("Max TP", value=0.15, step=0.005, format="%.3f")
     tp_step = st.number_input("Step", value=0.005, step=0.001, format="%.3f")
 
@@ -373,64 +373,42 @@ for ticker in tickers:
 
     with st.expander("Full performance summary (vs Buy & Hold)"):
         summary_data = [
-        {
-            "Strategy": "Heikin-Ashi (long-only)",
-            "Opt Long TP": f"{best_tp_ha*100:.1f}%",
-            "Ann Ret": f"{ha_ann_r*100:.1f}%",
-            "Ann Vol": f"{ha_ann_v*100:.1f}%",
-            "Sharpe": round(ha_sha, 2),
-            "Calmar": round(ha_cal, 2),
-            "Trade Price": ha_trade_price,
-            "TP Price": ha_tp_price,
-            "TP Diff": None if ha_trade_price is None else round(ha_tp_price - ha_trade_price, 2),
-        },
-        {
-            "Strategy": f"EMA({ema_length}) (long-only)",
-            "Opt Long TP": f"{best_tp_ema*100:.1f}%",
-            "Ann Ret": f"{ema_ann_r*100:.1f}%",
-            "Ann Vol": f"{ema_ann_v*100:.1f}%",
-            "Sharpe": round(ema_sha, 2),
-            "Calmar": round(ema_cal, 2),
-            "Trade Price": ema_trade_price,
-            "TP Price": ema_tp_price,
-            "TP Diff": None if ema_trade_price is None else round(ema_tp_price - ema_trade_price, 2),
-        },
-        {
-            "Strategy": "Buy & Hold",
-            "Opt Long TP": "—",
-            "Ann Ret": f"{bh_ann_r*100:.1f}%",
-            "Ann Vol": f"{bh_ann_v*100:.1f}%",
-            "Sharpe": round(bh_sha, 2),
-            "Calmar": round(bh_cal, 2),
-            "Trade Price": round(float(df["Close"].iloc[0]), 2),
-            "TP Price": "—",
-            "TP Diff": "—",
-        },
-    ]
-    results_df = pd.DataFrame(summary_data)
-    st.dataframe(results_df, use_container_width=True, hide_index=True)
-
-    ha_status = trend_status(df, "HA_Trend", best_tp_ha, best_short_tp_ha)
-    ema_status = trend_status(df, "EMA_Trend", best_tp_ema, best_short_tp_ema)
-
-    st.markdown("**Today's Action — Live Position Status**")
-    s1, s2 = st.columns(2)
-    for col, name, status, l_tp, s_tp in [
-        (s1, "Heikin-Ashi", ha_status, best_tp_ha, best_short_tp_ha),
-        (s2, f"EMA({ema_length})", ema_status, best_tp_ema, best_short_tp_ema),
-    ]:
-        with col:
-            st.markdown(f"**{name}**")
-            st.write(f"Side: {status['side']}")
-            st.write(f"Day in current trend: {status['days_in_trend']}")
-            st.write(f"Entry: {status['entry_date']} @ {status['entry_price']}")
-            st.write(f"Current price: {status['current_price']}")
-            st.write(f"Unrealized P&L: {status['pnl_pct']:+.2f}%")
-            st.write(f"{status['target_label']}: **{status['target_price']}**")
-            if status["side"] == "LONG":
-                st.caption(f"Optimal long TP used: {l_tp*100:.1f}%")
-            else:
-                st.caption(f"Optimal short TP used (informational): {s_tp*100:.1f}%")
+            {
+                "Strategy": "Heikin-Ashi (long-only)",
+                "Opt Long TP": f"{best_tp_ha*100:.1f}%",
+                "Ann Ret": f"{ha_ann_r*100:.1f}%",
+                "Ann Vol": f"{ha_ann_v*100:.1f}%",
+                "Sharpe": round(ha_sha, 2),
+                "Calmar": round(ha_cal, 2),
+                "Trade Price": ha_trade_price,
+                "TP Price": ha_tp_price,
+                "TP Diff": None if ha_trade_price is None else round(ha_tp_price - ha_trade_price, 2),
+            },
+            {
+                "Strategy": f"EMA({ema_length}) (long-only)",
+                "Opt Long TP": f"{best_tp_ema*100:.1f}%",
+                "Ann Ret": f"{ema_ann_r*100:.1f}%",
+                "Ann Vol": f"{ema_ann_v*100:.1f}%",
+                "Sharpe": round(ema_sha, 2),
+                "Calmar": round(ema_cal, 2),
+                "Trade Price": ema_trade_price,
+                "TP Price": ema_tp_price,
+                "TP Diff": None if ema_trade_price is None else round(ema_tp_price - ema_trade_price, 2),
+            },
+            {
+                "Strategy": "Buy & Hold",
+                "Opt Long TP": "—",
+                "Ann Ret": f"{bh_ann_r*100:.1f}%",
+                "Ann Vol": f"{bh_ann_v*100:.1f}%",
+                "Sharpe": round(bh_sha, 2),
+                "Calmar": round(bh_cal, 2),
+                "Trade Price": round(float(df["Close"].iloc[0]), 2),
+                "TP Price": "—",
+                "TP Diff": "—",
+            },
+        ]
+        results_df = pd.DataFrame(summary_data)
+        st.dataframe(results_df, use_container_width=True, hide_index=True)
 
     fig, ax = plt.subplots(figsize=(12, 5))
     ax.plot(df.index, cum_ha, label=f"Heikin-Ashi (TP={best_tp_ha*100:.1f}%)", linewidth=1.8)
