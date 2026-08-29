@@ -279,6 +279,40 @@ def get_live_quote(ticker):
     return None
 
 
+def preview_signal_with_live_price(df, live_price, ema_length):
+    """Forward-looking, PROVISIONAL preview only -- does not touch df,
+    the backtest returns, or any stat shown elsewhere. Treats the live
+    quote as a stand-in for "today's close" and recomputes just the
+    HA/EMA trend classification for that one hypothetical bar, so you
+    can see what the signal would become IF the session settled right
+    now. This is intentionally NOT fed back into df/backtest_long_only/
+    optimize_*_tp -- doing so would let a still-moving intraday price
+    flip the trend classification back and forth before the real close
+    prints, making the backtest and 'Current Action' non-reproducible
+    within the same day. Keep this strictly a preview."""
+    if live_price is None or len(df) == 0:
+        return None
+
+    last_close = float(df["Close"].iloc[-1])
+    prev_ha_close = float(df["HA_Close"].iloc[-1])
+    prev_ha_open = float(df["HA_Open"].iloc[-1])
+    prev_ema = float(df["EMA_Val"].iloc[-1])
+
+    # Synthetic hypothetical bar: last settled close -> live price.
+    o, c = last_close, live_price
+    h, l = max(o, c), min(o, c)
+
+    ha_close_new = (o + h + l + c) / 4
+    ha_open_new = (prev_ha_open + prev_ha_close) / 2
+    ha_trend_new = 1 if ha_close_new >= ha_open_new else -1
+
+    alpha = 2 / (ema_length + 1)
+    ema_new = c * alpha + prev_ema * (1 - alpha)
+    ema_trend_new = 1 if c >= ema_new else -1
+
+    return {"ha_trend": ha_trend_new, "ema_trend": ema_trend_new}
+
+
 def build_signals(df, ema_length):
     df = df.copy()
     df["HA_Close"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
@@ -430,6 +464,34 @@ for idx, ticker in enumerate(tickers):
                "match what you'd see on the Yahoo Finance website right now -- the two can genuinely "
                "differ until the current session settles.")
 
+    if live_price is not None:
+        preview = preview_signal_with_live_price(df, live_price, ema_length)
+        if preview is not None:
+            ha_now_long = ha_status["side"] == "LONG"
+            ema_now_long = ema_status["side"] == "LONG"
+            ha_preview_long = preview["ha_trend"] == 1
+            ema_preview_long = preview["ema_trend"] == 1
+
+            def _side_str(is_long):
+                return "🟢 LONG" if is_long else "⚪ FLAT"
+
+            def _flip_note(now_long, preview_long):
+                return " *(would flip)*" if now_long != preview_long else ""
+
+            with st.expander("🔮 Live preview — what the signal would be if today settled right now (provisional)"):
+                st.caption(
+                    "This is NOT part of the backtest, the table below, or the plot -- it's a "
+                    "what-if using the live quote as a stand-in for today's close. It will keep "
+                    "changing until the session actually settles, and can flip back before it does."
+                )
+                p1, p2 = st.columns(2)
+                p1.write(f"**Heikin-Ashi:** {_side_str(ha_now_long)} (settled) → "
+                          f"{_side_str(ha_preview_long)} (if settled at {live_price:.2f})"
+                          f"{_flip_note(ha_now_long, ha_preview_long)}")
+                p2.write(f"**EMA({ema_length}):** {_side_str(ema_now_long)} (settled) → "
+                          f"{_side_str(ema_preview_long)} (if settled at {live_price:.2f})"
+                          f"{_flip_note(ema_now_long, ema_preview_long)}")
+
     st.markdown("#### 🎯 Current Action & Target Levels (based on optimal TP thresholds)")
     a1, a2 = st.columns(2)
     for col, name, status, l_tp, s_tp in [
@@ -509,6 +571,10 @@ for idx, ticker in enumerate(tickers):
     fig.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
+
+
+
+
 
 
 
