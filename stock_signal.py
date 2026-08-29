@@ -253,6 +253,32 @@ def load_data(ticker, start, end, max_retries=3):
     return last_df  # best available result after retries, even if still unusable -- caller checks it
 
 
+@st.cache_data(ttl=120, show_spinner=False)
+def get_live_quote(ticker):
+    """Best-effort real-time/delayed quote -- separate from the daily
+    historical series used for signals/backtesting. This is what
+    should match the price shown on the Yahoo Finance website, since
+    that reflects live/intraday (and sometimes pre/after-market)
+    trading, whereas the daily bar used elsewhere in this app only
+    updates once a session is fully settled. Short TTL (2 min) since
+    the whole point of this value is to be current."""
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        price = fi.get("last_price") if isinstance(fi, dict) else getattr(fi, "last_price", None)
+        if price:
+            return float(price)
+    except Exception:
+        pass
+    try:
+        info = yf.Ticker(ticker).info
+        price = info.get("regularMarketPrice") or info.get("currentPrice")
+        if price:
+            return float(price)
+    except Exception:
+        pass
+    return None
+
+
 def build_signals(df, ema_length):
     df = df.copy()
     df["HA_Close"] = (df["Open"] + df["High"] + df["Low"] + df["Close"]) / 4
@@ -382,10 +408,27 @@ for idx, ticker in enumerate(tickers):
     ema_status = trend_status(df, "EMA_Trend", best_tp_ema, best_short_tp_ema)
 
     current_price = float(last["Close"])
+    live_price = get_live_quote(ticker)
 
-    top1, top2 = st.columns(2)
-    top1.metric("Current Price", f"{current_price:.2f}")
-    top2.metric("RSI(14)", f"{float(last['RSI']):.1f}" if not np.isnan(last["RSI"]) else "n/a")
+    top1, top2, top3 = st.columns(3)
+    top1.metric("Last Settled Close (used in backtest)", f"{current_price:.2f}",
+                help=f"Daily bar dated {df.index[-1].strftime('%Y-%m-%d')}. This is what drives "
+                     f"the signals and stats below.")
+    if live_price is not None:
+        gap_vs_settled = (live_price - current_price) / current_price * 100
+        top2.metric("Live Quote (from Yahoo Finance)", f"{live_price:.2f}",
+                    delta=f"{gap_vs_settled:+.2f}% vs settled close",
+                    help="Real-time/delayed quote -- this is what the Yahoo Finance website shows, "
+                         "and can differ from the settled daily close, especially for near-"
+                         "continuously-traded tickers like futures, or during/after market hours.")
+    else:
+        top2.metric("Live Quote (from Yahoo Finance)", "n/a")
+    top3.metric("RSI(14)", f"{float(last['RSI']):.1f}" if not np.isnan(last["RSI"]) else "n/a")
+
+    st.caption("ℹ️ **Last Settled Close** is the completed daily bar the backtest and target levels "
+               "below are calculated from. **Live Quote** is a separate, real-time lookup meant to "
+               "match what you'd see on the Yahoo Finance website right now -- the two can genuinely "
+               "differ until the current session settles.")
 
     st.markdown("#### 🎯 Current Action & Target Levels (based on optimal TP thresholds)")
     a1, a2 = st.columns(2)
@@ -400,7 +443,7 @@ for idx, ticker in enumerate(tickers):
             st.write(f"Action: **{action_label}**")
             gap_pct = (status["target_price"] - current_price) / current_price * 100
             g1, g2 = st.columns(2)
-            g1.metric("Current Price", f"{current_price:.2f}")
+            g1.metric("Settled Close", f"{current_price:.2f}")
             g2.metric(
                 "Target Price" if is_long else "Informational Target",
                 f"{status['target_price']:.2f}",
@@ -466,8 +509,6 @@ for idx, ticker in enumerate(tickers):
     fig.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
-
-
 
 
 
