@@ -445,16 +445,18 @@ for idx, ticker in enumerate(tickers):
     live_price = get_live_quote(ticker)
 
     top1, top2, top3 = st.columns(3)
-    top1.metric("Last Settled Close (used in backtest)", f"{current_price:.2f}",
-                help=f"Daily bar dated {df.index[-1].strftime('%Y-%m-%d')}. This is what drives "
-                     f"the signals and stats below.")
+    settled_date_str = df.index[-1].strftime("%Y-%m-%d")
+    top1.metric("Last Settled Close (used in backtest)", f"{current_price:.2f}")
+    top1.caption(f"As of {settled_date_str}")
     if live_price is not None:
         gap_vs_settled = (live_price - current_price) / current_price * 100
         top2.metric("Live Quote (from Yahoo Finance)", f"{live_price:.2f}",
                     delta=f"{gap_vs_settled:+.2f}% vs settled close",
                     help="Real-time/delayed quote -- this is what the Yahoo Finance website shows, "
                          "and can differ from the settled daily close, especially for near-"
-                         "continuously-traded tickers like futures, or during/after market hours.")
+                         "continuously-traded tickers like futures, during/after market hours, or "
+                         "for exchanges (like BIST) where the official close comes from a separate "
+                         "closing auction rather than the last continuous trade.")
     else:
         top2.metric("Live Quote (from Yahoo Finance)", "n/a")
     top3.metric("RSI(14)", f"{float(last['RSI']):.1f}" if not np.isnan(last["RSI"]) else "n/a")
