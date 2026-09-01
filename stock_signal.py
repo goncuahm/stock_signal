@@ -501,8 +501,10 @@ for idx, ticker in enumerate(tickers):
         (a2, f"EMA({ema_length})", ema_status, best_tp_ema, best_short_tp_ema),
     ]:
         with col:
+            # is_long = status["side"] == "LONG"
+            # action_label = "🟢 LONG — holding" if is_long else "⚪ FLAT — no position (long-only strategy)"
             is_long = status["side"] == "LONG"
-            action_label = "🟢 LONG — holding" if is_long else "⚪ FLAT — no position (long-only strategy)"
+            action_label = "🟢 LONG — holding" if is_long else "🔴 SHORT (informational only, no position — long-only strategy)"
             st.markdown(f"**{name}**")
             st.write(f"Action: **{action_label}**")
             gap_pct = (status["target_price"] - current_price) / current_price * 100
