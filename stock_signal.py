@@ -11,7 +11,7 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Trend Strategy Backtester", layout="wide")
 
-DEFAULT_TICKERS = "SI=F, XU030.IS"
+DEFAULT_TICKERS = "SI=F, XU030.IS, EREGL.IS, SASA.IS, ENJSA.IS"
 
 
 # ============================================================
