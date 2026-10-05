@@ -41,6 +41,10 @@ MIN_LABELLED   = 30           # minimum labelled days for a fit
 LEAD_DAYS    = 120            # extra calendar days downloaded for the EMA / HA warm-up
 MODELS_FILE  = "regime_models.json"
 P_LONG, P_SHORT = 0.60, 0.40   # defaults; adjustable in the sidebar
+GRID_SHORT   = np.round(np.arange(0.29, 0.4901, 0.02), 2)   # candidate cash thresholds (optimisation)
+GRID_LONG    = np.round(np.arange(0.51, 0.7101, 0.02), 2)   # candidate long thresholds (optimisation)
+MIN_EXPOSURE = 0.20           # a threshold pair must keep the strategy in the market ≥ 20% of training days
+OPT_AFTER_MONTHS = 6          # with optimisation on: fixed thresholds for the first 6 months of the backtest
 BIST_CLOSE   = datetime.time(18, 15)   # after the closing auction (Istanbul time)
 PRICE_TTL    = 300            # seconds prices are cached (5 minutes)
 
@@ -137,39 +141,76 @@ def fit_spec(X, y):
             'intercept': float(sign * lr.intercept_[0]), 'features': FEATURES}
 
 
-def walk_forward_in_app(close, X, dates, t0, a):
+def choose_thresholds(p_tr, close_tr, cash_tr, fee):
+    """Best (cash, long) threshold pair on the training window: long-only strategy net of costs,
+    Sharpe ratio in excess of cash, at least MIN_EXPOSURE of days in the market."""
+    best, best_s = None, -np.inf
+    for ps in GRID_SHORT:
+        for pl in GRID_LONG:
+            r, e, _ = long_only(close_tr, regime_signal(p_tr, pl, ps), cash_tr, fee, 0)
+            if e.mean() < MIN_EXPOSURE or r.std() < 1e-10:
+                continue
+            sh = (r - cash_tr).mean() / r.std() * np.sqrt(252)
+            if sh > best_s:
+                best, best_s = (float(ps), float(pl)), sh
+    return best, best_s
+
+
+def walk_forward_in_app(close, X, dates, t0, a, cash=None, fee=0.0, optimise=False,
+                        p_long=P_LONG, p_short=P_SHORT):
     """Expanding-window training on data from index t0 (TRAIN_START). Refit on the first trading
     day of every month from index a (BACKTEST_START) on; each model predicts until the next refit.
-    Labels at each refit are computed from prices t0..R only."""
+    Labels at each refit are computed from prices t0..R only. With optimise=True the thresholds are
+    also chosen at each refit, on the training window t0..R only, and used until the next refit — starting
+    OPT_AFTER_MONTHS after BACKTEST_START; before that the given (fixed) thresholds are used."""
     n = len(close)
     prob = np.full(n, np.nan)
+    thl, ths = np.full(n, np.nan), np.full(n, np.nan)
     month = dates[a:].to_period('M')
     refits = [a + int(i) for i in np.r_[0, np.where(month[1:] != month[:-1])[0] + 1]]
-    spec, n_refits, n_lab, first = None, 0, 0, None
+    spec, n_refits, n_lab, first, table = None, 0, 0, None, []
+    cur_thr = (p_short, p_long)
+    opt_from = dates[a] + pd.DateOffset(months=OPT_AFTER_MONTHS)
     for k, R in enumerate(refits):
         seg = close[t0:R + 1]
         y = labels_from(smooth_pivots(seg), len(seg))
         tr = np.where(np.isfinite(y) & np.isfinite(X[t0:R + 1]).all(axis=1))[0]
-        if len(tr) >= MIN_LABELLED and len(np.unique(y[tr])) == 2:
+        refit = len(tr) >= MIN_LABELLED and len(np.unique(y[tr])) == 2
+        if refit:
             spec = fit_spec(X[t0 + tr], y[tr])
             n_refits, n_lab = n_refits + 1, len(tr)
         if spec is None:
             continue                                   # not enough labelled history yet → stay in cash
+        if optimise and refit:
+            if dates[R] >= opt_from:
+                best, best_s = choose_thresholds(predict_proba(spec, X[t0:R + 1]), close[t0:R + 1],
+                                                 cash[t0:R + 1], fee)
+                cur_thr = best if best is not None else (p_short, p_long)
+                method = 'optimised' if best is not None else 'fixed (no pair met the 20% rule)'
+            else:
+                cur_thr, best_s, method = (p_short, p_long), np.nan, f'fixed (first {OPT_AFTER_MONTHS} months)'
+            table.append({'Refit': str(dates[R].date()), 'Training days': R - t0 + 1, 'Method': method,
+                          'Cash if P ≤': cur_thr[0], 'Long if P ≥': cur_thr[1],
+                          'Training Sharpe (xs)': best_s})
         b = refits[k + 1] if k + 1 < len(refits) else n
         prob[R:b] = predict_proba(spec, X[R:b])
+        ths[R:b], thl[R:b] = cur_thr
         first = R if first is None else first
     if spec is not None:
         spec.update({'n_train': n_lab, 'n_refits': n_refits, 'first_prediction': str(dates[first].date())})
-    return prob, spec
+    return prob, spec, thl, ths, table
 
 
 def regime_signal(p, p_long=P_LONG, p_short=P_SHORT):
+    """+1 long / -1 cash with a hysteresis band; thresholds may be numbers or per-day arrays."""
+    pl = np.broadcast_to(np.asarray(p_long, float), len(p))
+    ps = np.broadcast_to(np.asarray(p_short, float), len(p))
     s, cur = np.zeros(len(p)), 0.0
     for t in range(len(p)):
         if np.isfinite(p[t]):
-            if p[t] >= p_long:
+            if p[t] >= pl[t]:
                 cur = 1.0
-            elif p[t] <= p_short:
+            elif p[t] <= ps[t]:
                 cur = -1.0
         s[t] = cur
     return s
@@ -216,25 +257,27 @@ def perf(r, expo, ent, cash, a, b):
             'Trades / yr': ent[a:b].sum() / yrs if yrs > 0 else np.nan}
 
 
-def analyse(df, spec, ema_len, fee, cash, train_in_app=True, p_long=P_LONG, p_short=P_SHORT):
+def analyse(df, spec, ema_len, fee, cash, train_in_app=True, p_long=P_LONG, p_short=P_SHORT, optimise=False):
     close = df['Close'].values.astype(float)
     n = len(close)
     F, aux = build_features(df, ema_len)
     sigs = {}
     prob = None
     a = int(np.searchsorted(df.index, pd.Timestamp(BACKTEST_START)))
+    thl, ths, table = np.full(n, p_long), np.full(n, p_short), []
     if train_in_app:
         t0 = int(np.searchsorted(df.index, pd.Timestamp(TRAIN_START)))
-        prob, spec = walk_forward_in_app(close, F[FEATURES].values, df.index, t0, a)
+        prob, spec, thl, ths, table = walk_forward_in_app(close, F[FEATURES].values, df.index, t0, a, cash, fee,
+                                                          optimise, p_long, p_short)
         if spec is None:
             return None                              # not enough labelled data yet
         spec.update({'train_start': str(df.index[t0].date()), 'cutoff': str(df.index[-1].date()),
                      'ema_len': ema_len})
-        sigs['Logit [EMA + HA]'] = regime_signal(prob, p_long, p_short)
+        sigs['Logit [EMA + HA]'] = regime_signal(prob, thl, ths)
     elif spec is not None:
         prob = predict_proba(spec, F[spec['features']].values)
         prob[:a] = np.nan                            # the saved model is applied from BACKTEST_START on
-        sigs['Logit [EMA + HA]'] = regime_signal(prob, p_long, p_short)
+        sigs['Logit [EMA + HA]'] = regime_signal(prob, thl, ths)
     sigs[f'EMA({ema_len}) rule'] = F['EMA_signal'].values
     sigs['HA rule'] = F['HA_trend'].values
     strats = {nm: long_only(close, sg, cash, fee, a) for nm, sg in sigs.items()}
@@ -243,7 +286,8 @@ def analyse(df, spec, ema_len, fee, cash, train_in_app=True, p_long=P_LONG, p_sh
     bh[a] = cash[a] - fee
     strats['Buy & hold'] = (bh, np.r_[np.zeros(a + 1), np.ones(n - a - 1)], np.r_[np.zeros(a), 1.0, np.zeros(n - a - 1)])
     return {'a': a, 'F': F, 'aux': aux, 'prob': prob, 'sigs': sigs, 'strats': strats, 'spec': spec,
-            'p_long': p_long, 'p_short': p_short}
+            'thl': thl, 'ths': ths, 'thr_table': table, 'optimised': bool(optimise and train_in_app),
+            'opt_from': next((pd.Timestamp(r['Refit']) for r in table if r['Method'] == 'optimised'), None)}
 
 
 def position_status(df, sig, a):
@@ -275,7 +319,8 @@ def live_preview(res, df, live_price, ema_len):
     if spec is not None and 'Logit [EMA + HA]' in res['sigs']:
         p = float(predict_proba(spec, [[x[f] for f in spec['features']]])[0])
         cur = res['sigs']['Logit [EMA + HA]'][-1]
-        out['p'], out['logit'] = p, (1.0 if p >= res['p_long'] else (-1.0 if p <= res['p_short'] else cur))
+        pl, ps = res['thl'][-1], res['ths'][-1]
+        out['p'], out['logit'] = p, (1.0 if p >= pl else (-1.0 if p <= ps else cur))
     return out
 
 
@@ -319,8 +364,16 @@ def main():
                                          help="Created by export_regime_model.py in Colab. If omitted, the app "
                                               f"looks for {MODELS_FILE} next to the app.")
         st.subheader("Signal thresholds")
-        p_long = st.slider("Go long when P(up) ≥", 0.50, 0.90, P_LONG, 0.01)
-        p_short = st.slider("Go to cash when P(up) ≤", 0.10, 0.50, P_SHORT, 0.01,
+        optimise = st.checkbox("Choose thresholds optimally from the training data", value=False,
+                               disabled=not train_in_app,
+                               help=f"The thresholds below are used for the first {OPT_AFTER_MONTHS} months of "
+                                    "the backtest. After that, at every monthly refit, cash thresholds 0.29–0.49 and "
+                                    "long thresholds 0.51–0.71 (steps of 0.02) are tested on the training data only; "
+                                    "the pair with the best Sharpe ratio in excess of cash is used until the next "
+                                    "refit. Available with in-app training.") and train_in_app
+        lbl = f" (first {OPT_AFTER_MONTHS} months)" if optimise else ""
+        p_long = st.slider("Go long when P(up) ≥" + lbl, 0.50, 0.90, P_LONG, 0.01)
+        p_short = st.slider("Go to cash when P(up) ≤" + lbl, 0.10, 0.50, P_SHORT, 0.01,
                             help="Between the two thresholds the previous position is kept.")
         st.subheader("Costs and cash")
         fee = st.number_input("Cost per side", value=0.0010, step=0.0005, format="%.4f")
@@ -377,7 +430,8 @@ def main():
         dates_first = df.index[int(np.searchsorted(df.index, pd.Timestamp(BACKTEST_START)))]
         if train_in_app:
             ema_len = int(ema_in)
-            res = analyse(df, None, ema_len, float(fee), cash, train_in_app=True, p_long=p_long, p_short=p_short)
+            res = analyse(df, None, ema_len, float(fee), cash, train_in_app=True, p_long=p_long, p_short=p_short,
+                          optimise=optimise)
             if res is None:
                 st.warning(f"Not enough data since {TRAIN_START} to train on **{ticker}** "
                            "(needs at least one complete up- and down-leg).")
@@ -420,7 +474,20 @@ def main():
                   delta=f"{(live / last_close - 1) * 100:+.2f}%" if live else None)
         p_now = res['prob'][-1] if res['prob'] is not None else np.nan
         c3.metric("Logit P(up-leg)", f"{p_now:.2f}" if np.isfinite(p_now) else "n/a",
-                  help=f"Long if ≥ {p_long:.2f}, cash if ≤ {p_short:.2f}, otherwise the previous position is kept.")
+                  help=f"Long if ≥ {res['thl'][-1]:.2f}, cash if ≤ {res['ths'][-1]:.2f}, otherwise the previous "
+                       "position is kept" + (" (thresholds chosen on the training data)." if res['optimised'] else "."))
+        if res['optimised'] and res['thr_table']:
+            last = res['thr_table'][-1]
+            st.caption(f"🎚️ Thresholds in use since the latest refit ({last['Refit']}, {last['Method']}): "
+                       f"**long if P ≥ {last['Long if P ≥']:.2f}, cash if P ≤ {last['Cash if P ≤']:.2f}**. "
+                       + (f"Optimisation started {res['opt_from'].date()}." if res['opt_from'] is not None else
+                          f"Optimisation starts {OPT_AFTER_MONTHS} months after {BACKTEST_START}."))
+            with st.expander("Thresholds chosen at each monthly refit (training data only)"):
+                st.dataframe(pd.DataFrame(res['thr_table']).set_index('Refit')
+                             .style.format({'Cash if P ≤': '{:.2f}', 'Long if P ≥': '{:.2f}',
+                                            'Training Sharpe (xs)': '{:.2f}'}, na_rep='—'), **WIDE)
+                st.caption("Each pair is chosen using only data up to its refit date and applied to the "
+                           "following month, so the backtest stays out of sample.")
 
         st.markdown("#### 🎯 Current positions (long-only, after the last settled close)")
         cols = st.columns(len(res['sigs']))
@@ -477,7 +544,7 @@ def main():
 
         key = 'Logit [EMA + HA]' if 'Logit [EMA + HA]' in res['sigs'] else f'EMA({ema_len}) rule'
         sg = res['sigs'][key]
-        z = max(a0, n - 126)
+        z = a0                                       # whole backtest window (from BACKTEST_START)
         px = df['Close'].values
         axes[1].plot(dates[z:], px[z:], color='black', lw=1)
         long_ = (sg[z:] == 1).astype(int)
@@ -495,13 +562,19 @@ def main():
                          + (" (intraday)" if intraday_today else ""), (dates[-1], px[-1]),
                          textcoords='offset points', xytext=(-10, 10), ha='right', fontsize=9,
                          bbox=dict(facecolor='white', edgecolor='grey', alpha=0.85, pad=2))
-        axes[1].set_title(f"{key} — last 6 months to {dates[-1].date()} (green = long, red = cash; ▲ buy, ▼ sell)",
-                          fontweight='bold')
+        axes[1].set_title(f"{key} — regimes {dates[z].date()} → {dates[-1].date()} (green = long, red = cash; "
+                          "▲ buy, ▼ sell)", fontweight='bold')
         axes[1].grid(alpha=0.3)
         if res['prob'] is not None:
             axes[2].plot(dates[z:], res['prob'][z:], color='tab:purple')
-            axes[2].axhline(p_long, color='green', ls='--', lw=1)
-            axes[2].axhline(p_short, color='red', ls='--', lw=1)
+            axes[2].step(dates[z:], res['thl'][z:], where='post', color='green', ls='--', lw=1.6, label='long threshold')
+            axes[2].step(dates[z:], res['ths'][z:], where='post', color='red', ls='--', lw=1.6, label='cash threshold')
+            if res['opt_from'] is not None:
+                axes[2].axvline(res['opt_from'], color='black', ls=':', lw=1.2)
+                axes[2].annotate('thresholds optimised from here →', (res['opt_from'], 0.97), ha='right', va='top',
+                                 fontsize=8, textcoords='offset points', xytext=(-4, 0))
+            axes[2].set_title("P(up-leg) with the long (green) and cash (red) thresholds in use", fontsize=10)
+            axes[2].legend(loc='lower left', fontsize=8, ncol=2)
             axes[2].scatter([dates[-1]], [res['prob'][-1]], color='tab:purple', s=40, zorder=5)
             axes[2].annotate(f"{res['prob'][-1]:.2f} ({dates[-1].strftime('%d %b')})", (dates[-1], res['prob'][-1]),
                              textcoords='offset points', xytext=(-8, 8), ha='right', fontsize=9, color='tab:purple')
