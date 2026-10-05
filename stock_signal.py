@@ -1,4 +1,3 @@
-
 # ============================================================
 #  REGIME SIGNALS — LIVE APP (Streamlit, light version)
 #  Backtest window: from BACKTEST_START (2026-01-01) to the latest close, for
@@ -46,7 +45,6 @@ GRID_SHORT   = np.round(np.arange(0.29, 0.4901, 0.02), 2)   # candidate cash thr
 GRID_LONG    = np.round(np.arange(0.51, 0.7101, 0.02), 2)   # candidate long thresholds (optimisation)
 MIN_EXPOSURE = 0.20           # a threshold pair must keep the strategy in the market ≥ 20% of training days
 OPT_AFTER_MONTHS = 6          # with optimisation on: fixed thresholds for the first 6 months of the backtest
-ZZ_DELTA     = 0.20           # experimental P(up) zig-zag: move (in probability points) that confirms a turn
 BIST_CLOSE   = datetime.time(18, 15)   # after the closing auction (Istanbul time)
 PRICE_TTL    = 300            # seconds prices are cached (5 minutes)
 
@@ -259,8 +257,7 @@ def perf(r, expo, ent, cash, a, b):
             'Trades / yr': ent[a:b].sum() / yrs if yrs > 0 else np.nan}
 
 
-def analyse(df, spec, ema_len, fee, cash, train_in_app=True, p_long=P_LONG, p_short=P_SHORT, optimise=False,
-            zz=None):
+def analyse(df, spec, ema_len, fee, cash, train_in_app=True, p_long=P_LONG, p_short=P_SHORT, optimise=False):
     close = df['Close'].values.astype(float)
     n = len(close)
     F, aux = build_features(df, ema_len)
@@ -281,9 +278,6 @@ def analyse(df, spec, ema_len, fee, cash, train_in_app=True, p_long=P_LONG, p_sh
         prob = predict_proba(spec, F[spec['features']].values)
         prob[:a] = np.nan                            # the saved model is applied from BACKTEST_START on
         sigs['Logit [EMA + HA]'] = regime_signal(prob, thl, ths)
-    zz_piv = None
-    if prob is not None and zz is not None:
-        sigs['P(up) zig-zag'], zz_piv = p_zigzag(prob, **zz)
     sigs[f'EMA({ema_len}) rule'] = F['EMA_signal'].values
     sigs['HA rule'] = F['HA_trend'].values
     strats = {nm: long_only(close, sg, cash, fee, a) for nm, sg in sigs.items()}
@@ -292,42 +286,8 @@ def analyse(df, spec, ema_len, fee, cash, train_in_app=True, p_long=P_LONG, p_sh
     bh[a] = cash[a] - fee
     strats['Buy & hold'] = (bh, np.r_[np.zeros(a + 1), np.ones(n - a - 1)], np.r_[np.zeros(a), 1.0, np.zeros(n - a - 1)])
     return {'a': a, 'F': F, 'aux': aux, 'prob': prob, 'sigs': sigs, 'strats': strats, 'spec': spec,
-            'zz_piv': zz_piv, 'zz': zz,
             'thl': thl, 'ths': ths, 'thr_table': table, 'optimised': bool(optimise and train_in_app),
             'opt_from': next((pd.Timestamp(r['Refit']) for r in table if r['Method'] == 'optimised'), None)}
-
-
-def p_zigzag(p, delta=ZZ_DELTA, contrarian=True):
-    """Experimental zig-zag on P(up), causal. A P-peak is confirmed when P falls `delta` below its highest
-    value since the last confirmed bottom; a P-bottom is confirmed when P rises `delta` above its lowest
-    value since the last confirmed peak. Contrarian (RSI-like): BUY at a confirmed P-peak (P has fallen),
-    SELL at a confirmed P-bottom (P has risen). Trend-following: the reverse.
-    Returns (+1/-1 signal, list of pivots (extreme_idx, confirm_idx, 'P' or 'T'))."""
-    p = np.asarray(p, float)
-    n = len(p)
-    s, cur = np.zeros(n), 0.0
-    pivots = []
-    phase, hi_i, lo_i = 0, None, None            # phase: +1 rising (track high), -1 falling (track low), 0 unknown
-    for t in range(n):
-        if not np.isfinite(p[t]):
-            s[t] = cur
-            continue
-        if hi_i is None:
-            hi_i = lo_i = t
-        if phase >= 0 and p[t] > p[hi_i]:
-            hi_i = t
-        if phase <= 0 and p[t] < p[lo_i]:
-            lo_i = t
-        if phase >= 0 and p[t] <= p[hi_i] - delta:          # P-peak confirmed (P fell delta from its high)
-            pivots.append((hi_i, t, 'P'))
-            cur = 1.0 if contrarian else -1.0
-            phase, lo_i = -1, t
-        elif phase <= 0 and p[t] >= p[lo_i] + delta:        # P-bottom confirmed (P rose delta from its low)
-            pivots.append((lo_i, t, 'T'))
-            cur = -1.0 if contrarian else 1.0
-            phase, hi_i = 1, t
-        s[t] = cur
-    return s, pivots
 
 
 def position_status(df, sig, a):
@@ -361,8 +321,6 @@ def live_preview(res, df, live_price, ema_len):
         cur = res['sigs']['Logit [EMA + HA]'][-1]
         pl, ps = res['thl'][-1], res['ths'][-1]
         out['p'], out['logit'] = p, (1.0 if p >= pl else (-1.0 if p <= ps else cur))
-        if res.get('zz') is not None:
-            out['zz'] = p_zigzag(np.r_[res['prob'], p], **res['zz'])[0][-1]
     return out
 
 
@@ -417,16 +375,6 @@ def main():
         p_long = st.slider("Go long when P(up) ≥" + lbl, 0.50, 0.90, P_LONG, 0.01, key='p_long')
         p_short = st.slider("Go to cash when P(up) ≤" + lbl, 0.10, 0.50, P_SHORT, 0.01, key='p_short',
                             help="Between the two thresholds the previous position is kept.")
-        st.subheader("P(up) zig-zag (experimental)")
-        use_zz = st.checkbox("Add the P(up) zig-zag strategy", value=True,
-                             help="Turns in P(up) are confirmed once P moves the chosen amount from its last "
-                                  "peak or bottom. Not part of the research results.")
-        zz = None
-        if use_zz:
-            zz_delta = st.slider("Move that confirms a turn in P(up)", 0.05, 0.50, ZZ_DELTA, 0.05, key='zz_delta')
-            zz_dir = st.radio("Direction", ["Contrarian (RSI-like): buy after P falls, sell after P rises",
-                                            "Trend-following: buy after P rises, sell after P falls"], key='zz_dir')
-            zz = {'delta': zz_delta, 'contrarian': zz_dir.startswith('Contrarian')}
         st.subheader("Costs and cash")
         fee = st.number_input("Cost per side", value=0.0010, step=0.0005, format="%.4f")
         const_rate = st.number_input("Cash rate % p.a.", value=40.0, step=1.0) / 100
@@ -488,7 +436,7 @@ def main():
         if train_in_app:
             ema_len = int(ema_in)
             res = analyse(df, None, ema_len, float(fee), cash, train_in_app=True, p_long=p_long, p_short=p_short,
-                          optimise=optimise, zz=zz)
+                          optimise=optimise)
             if res is None:
                 st.warning(f"Not enough data since {TRAIN_START} to train on **{ticker}** "
                            "(needs at least one complete up- and down-leg).")
@@ -508,8 +456,7 @@ def main():
                            f"(add {ticker} to TICKERS in export_regime_model.py).")
             elif pd.Timestamp(spec['cutoff']) >= pd.Timestamp(BACKTEST_START):
                 st.caption(f"ℹ️ Model trained up to {spec['cutoff']}: results before that date are in-sample.")
-            res = analyse(df, spec, ema_len, float(fee), cash, train_in_app=False, p_long=p_long, p_short=p_short,
-                          zz=zz)
+            res = analyse(df, spec, ema_len, float(fee), cash, train_in_app=False, p_long=p_long, p_short=p_short)
         spec = res['spec']
         a0, n, dates = res['a'], len(df), df.index
 
@@ -566,8 +513,6 @@ def main():
                 txt = f"**EMA({ema_len}):** {side(pv['ema'])} · **HA:** {side(pv['ha'])}"
                 if pv['logit'] is not None:
                     txt = f"**Logit [EMA + HA]:** P(up) {pv['p']:.2f} → {side(pv['logit'])} · " + txt
-                if pv.get('zz') is not None:
-                    txt += f" · **P(up) zig-zag:** {side(pv['zz'])}"
                 st.write(txt)
                 st.caption("Signals become final only at the official close; intraday they can flip back.")
 
@@ -589,7 +534,7 @@ def main():
         fig, axes = plt.subplots(3 if res['prob'] is not None else 2, 1, figsize=(13, 10),
                                  gridspec_kw={'height_ratios': [3, 2, 1.3][:3 if res['prob'] is not None else 2]})
         colors = {'Logit [EMA + HA]': 'tab:red', f'EMA({ema_len}) rule': 'tab:blue', 'HA rule': 'tab:orange',
-                  'Buy & hold': 'grey', 'P(up) zig-zag': 'tab:green'}
+                  'Buy & hold': 'grey'}
         for nm, v in res['strats'].items():
             axes[0].plot(dates[a:], np.cumprod(1 + v[0][a:]), color=colors[nm], lw=2.2 if 'Logit' in nm else 1.4,
                          ls='--' if nm == 'Buy & hold' else '-', label=nm)
@@ -644,53 +589,6 @@ def main():
         fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
-
-        if res.get('zz_piv') is not None:
-            zc = res['zz']
-            st.markdown("#### 🧪 P(up) zig-zag (experimental)")
-            st.caption(f"A turn in P(up) is confirmed when P moves {zc['delta']:.2f} from its last peak or bottom. "
-                       + ("Contrarian: buy ▲ when a P-peak is confirmed (P has fallen), sell ▼ when a P-bottom is "
-                          "confirmed (P has risen)." if zc['contrarian'] else
-                          "Trend-following: buy ▲ when a P-bottom is confirmed (P has risen), sell ▼ when a P-peak "
-                          "is confirmed (P has fallen).")
-                       + " Not tested in the 20-year research.")
-            sgz = res['sigs']['P(up) zig-zag']
-            fig2, ax2 = plt.subplots(2, 1, figsize=(13, 7.5), gridspec_kw={'height_ratios': [1.4, 2]})
-            zz0 = a0
-            ax2[0].plot(dates[zz0:], res['prob'][zz0:], color='tab:purple', lw=1.1, label='P(up)')
-            piv = [(e, c, k) for e, c, k in res['zz_piv'] if e >= zz0]
-            if len(piv) > 1:
-                ax2[0].plot(dates[[e for e, _, _ in piv]], res['prob'][[e for e, _, _ in piv]], color='black',
-                            ls=':', lw=1.2, label='zig-zag of P (peaks / bottoms)')
-            for e, c, k in piv:
-                ax2[0].scatter(dates[e], res['prob'][e], s=22, facecolors='none',
-                               edgecolors='red' if k == 'P' else 'green', lw=1.2, zorder=4)
-            buys = [t for t in range(zz0 + 1, n) if sgz[t] == 1 and sgz[t - 1] != 1]
-            sells = [t for t in range(zz0 + 1, n) if sgz[t] == -1 and sgz[t - 1] == 1]
-            ax2[0].scatter(dates[buys], res['prob'][buys], marker='^', color='darkgreen', s=70, zorder=5,
-                           label='buy (turn confirmed)')
-            ax2[0].scatter(dates[sells], res['prob'][sells], marker='v', color='darkred', s=70, zorder=5,
-                           label='sell (turn confirmed)')
-            ax2[0].set_ylim(0, 1)
-            ax2[0].set_ylabel('P(up)')
-            ax2[0].set_title(f"{ticker} — zig-zag of P(up) (turn = move of {zc['delta']:.2f}), to {dates[-1].date()}; "
-                             "hollow circles = P peaks (red) / bottoms (green)", fontweight='bold')
-            ax2[0].legend(loc='lower left', fontsize=8, ncol=4)
-            ax2[0].grid(alpha=0.3)
-            for nm, colr, ls_, lw_ in [('P(up) zig-zag', 'tab:green', '-', 2.2),
-                                       ('Logit [EMA + HA]', 'tab:red', '-', 1.6),
-                                       ('Buy & hold', 'grey', '--', 1.4)]:
-                g = np.cumprod(1 + res['strats'][nm][0][a:])
-                ax2[1].plot(dates[a:], g, color=colr, ls=ls_, lw=lw_, label=f"{nm}: {(g[-1] - 1) * 100:+.1f}%")
-            ax2[1].axhline(1.0, color='black', lw=0.7, alpha=0.6)
-            ax2[1].set_title(f"Cumulative return ({window.lower()}): P(up) zig-zag vs threshold strategy vs buy & hold",
-                             fontweight='bold')
-            ax2[1].set_ylabel('Growth of 1')
-            ax2[1].legend(loc='upper left', fontsize=9)
-            ax2[1].grid(alpha=0.3)
-            fig2.tight_layout()
-            st.pyplot(fig2)
-            plt.close(fig2)
 
         if spec is not None:
             with st.expander("Model details"):
